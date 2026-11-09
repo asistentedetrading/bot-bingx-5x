@@ -3,7 +3,7 @@ from datetime import datetime
 
 API_KEY = os.getenv("API_KEY")
 SECRET = os.getenv("SECRET")
-SYMBOL = "BTC-USDT"
+SYMBOL = "ETH-USDT"
 TIMEFRAME = "5m"
 LEVERAGE = 5
 QTY_USDT = 20
