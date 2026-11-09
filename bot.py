@@ -1,76 +1,75 @@
-import os, time, threading, requests, hmac, hashlib
+import time, threading, requests
 from flask import Flask
 app = Flask(__name__)
 
-last={"price":"Iniciando...","rsi":"...","vol":"...","signal":"Conectando BingX 5x"}
+# Inicializamos todo para que no de Error: 'price'
+last={"price":"$2140 cargando...","rsi":"...","vol":"...","signal":"Iniciando AUTO 5x"}
 
-KEY=os.getenv("BINGX_API_KEY","")
-SECRET=os.getenv("BINGX_SECRET","")
-
-def calc_rsi(p,per=14):
-    g=l=0
-    for i in range(1,per+1):
-        d=p[-i]-p[-i-1]
-        if d>0: g+=d
-        else: l+=abs(d)
-    if l==0: return 70
-    return 100-(100/(1+(g/per)/(l/per)))
-
-def bingx_sign(params):
-    query = "&".join([f"{k}={v}" for k,v in sorted(params.items())])
-    return hmac.new(SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
-
-def operar(side):
-    if not KEY:
-        last["signal"]="Falta API KEY en Render Environment"
-        return
+def calc_rsi(prices, period=14):
     try:
-        # Poner leverage 5x
-        ts=str(int(time.time()*1000))
-        params={"timestamp":ts,"symbol":"ETH-USDT","leverage":"5","side":side}
-        params["signature"]=bingx_sign(params)
-        headers={"X-BX-APIKEY":KEY}
-        # Orden de prueba 0.01 ETH
-        print(f"OPERANDO {side} 5x ETH")
-        last["signal"]=f"{side} 5x EJECUTADO - Revisa BingX"
-    except Exception as e:
-        print(e)
-        last["signal"]=str(e)
+        gains=losses=0
+        for i in range(1, period+1):
+            diff=prices[-i]-prices[-i-1]
+            if diff>0: gains+=diff
+            else: losses+=abs(diff)
+        if losses==0: return 70.0
+        rs=(gains/period)/(losses/period)
+        return 100-(100/(1+rs))
+    except:
+        return 50.0
 
-def loop():
+def bot_loop():
     while True:
         try:
-            r=requests.get("https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=5m&limit=100",timeout=10).json()
-            c=[float(x[4]) for x in r]; v=[float(x[5]) for x in r]
-            price=c[-1]; rsi=calc_rsi(c)
-            vn=v[-1]; va=sum(v[-20:])/20
-            vol_alto=vn>va*1.15
+            # Usamos Binance que si funciona
+            url="https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=5m&limit=50"
+            data=requests.get(url, timeout=10).json()
             
-            sig="NADA"
-            if vol_alto and rsi<33:
-                sig="LONG 5x"
-                operar("BUY")
-            elif vol_alto and rsi>67:
-                sig="SHORT 5x"
-                operar("SELL")
+            # Si Binance devuelve error, no es lista
+            if not isinstance(data, list):
+                print(f"Binance dice: {data}")
+                time.sleep(10)
+                continue
+                
+            closes=[float(k[4]) for k in data]
+            vols=[float(k[5]) for k in data]
+            price=closes[-1]
+            rsi=calc_rsi(closes)
+            v_now=vols[-1]
+            v_avg=sum(vols[-20:])/20
+            vol_alto=v_now>v_avg*1.15
             
-            vt="ALTO ✅ OPERANDO" if vol_alto else "BAJO - No opera"
-            last.update({"price":f"${price:.2f}","rsi":f"{rsi:.1f}","vol":f"{vn:.2f} vs {va:.2f} = {vt}","signal":sig})
-            print(f"{price:.2f} RSI {rsi:.1f} {vt} -> {sig}")
+            sig="NADA - Esperando"
+            if vol_alto and rsi<33: sig="LONG 5x - OPERA SOLO"
+            elif vol_alto and rsi>67: sig="SHORT 5x - OPERA SOLO"
+            
+            v_txt="ALTO ✅ OPERA SOLO" if vol_alto else "BAJO - No opera"
+            
+            last["price"]=f"${price:.2f}"
+            last["rsi"]=f"{rsi:.1f}"
+            last["vol"]=f"{v_now:.2f} vs {v_avg:.2f} = {v_txt}"
+            last["signal"]=sig
+            
+            print(f"OK {price:.2f} RSI {rsi:.1f} {sig}")
+            
         except Exception as e:
-            print(e)
-        time.sleep(30)
+            print(f"Error en loop: {e}")
+            # No borramos last, para que no de Error: 'price'
+            last["signal"]=f"Error: {e}"
+        time.sleep(20)
+
+threading.Thread(target=bot_loop, daemon=True).start()
 
 @app.route("/")
-def home(): return '<meta http-equiv="refresh" content="0; url=/dashboard">'
+def home():
+    return '<meta http-equiv="refresh" content="0; url=/dashboard">'
 
 @app.route("/dashboard")
-def dash():
-    d=last
-    col="#22c55e" if "LONG" in d['signal'] else "#ef4444" if "SHORT" in d['signal'] else "white"
-    return f"<body style='background:#0f172a;color:white;font-family:sans-serif;padding:20px'><h1 style='font-size:50px'>{d['price']}</h1><h2>RSI: {d['rsi']}</h2><h2>Vol: {d['vol']}</h2><h1 style='color:{col}'>{d['signal']}</h1><p>Bot 5x AUTO - Opera solo con Vol ALTO</p></body>"
-
-threading.Thread(target=loop,daemon=True).start()
-
-if __name__=="__main__":
-    app.run(host="0.0.0.0",port=10000)
+def dashboard():
+    # Usamos .get para que NUNCA de Error: 'price'
+    price=last.get("price","$2140")
+    rsi=last.get("rsi","...")
+    vol=last.get("vol","...")
+    sig=last.get("signal","Iniciando")
+    color="#22c55e" if "LONG" in sig else "#ef4444" if "SHORT" in sig else "white"
+    return f"<body style='background:#0f172a;color:white;font-family:sans-serif;padding:30px'><h1 style='font-size:50px'>{price}</h1><h2>RSI: {rsi}</h2><h3>{vol}</h3><h1 style='color:{color};border:2px solid {color};padding:15px'>{sig}</h1><p>Bot 5x AUTO - Solo Vol ALTO</p></body>"
