@@ -1,59 +1,79 @@
-import time, hmac, hashlib, requests, pandas as pd, os
-from datetime import datetime
+from flask import Flask
+import os, time, threading, requests
+import pandas as pd
 
-API_KEY = os.getenv("API_KEY")
-SECRET = os.getenv("SECRET")
+app = Flask(__name__)
+
 SYMBOL = "ETH-USDT"
-TIMEFRAME = "5m"
-LEVERAGE = 5
-QTY_USDT = 20
-SL_PCT = 1.5
-TP_PCT = 3.0
-BASE_URL = "https://open-api.bingx.com"
+last_data = {"price": 0, "rsi": 0, "vol_now": 0, "vol_avg": 0, "vol_status": "...", "signal": "Cargando...", "time": "..."}
 
-def sign(p):
-    q = "&".join([f"{k}={v}" for k,v in sorted(p.items())])
-    return hmac.new(SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
-
-def get_klines(limit=250):
-    url = f"{BASE_URL}/openApi/swap/v3/quote/klines?symbol={SYMBOL}&interval={TIMEFRAME}&limit={limit}"
-    r = requests.get(url).json()
-    df = pd.DataFrame(r['data'], columns=['time','open','high','low','close','vol'])
-    df['close'] = df['close'].astype(float)
-    return df
-
-def calc_signals(df):
-    df['EMA200'] = df['close'].ewm(span=200).mean()
-    delta = df['close'].diff()
-    gain = delta.where(delta>0,0).rolling(14).mean()
-    loss = -delta.where(delta<0,0).rolling(14).mean()
-    rs = gain/loss
-    df['RSI'] = 100 - (100/(1+rs))
-    last = df.iloc[-1]
-    if last['RSI'] < 35 and last['close'] > last['EMA200']: return "LONG", last['RSI'], last['close']
-    if last['RSI'] > 65 and last['close'] < last['EMA200']: return "SHORT", last['RSI'], last['close']
-    return "NADA", last['RSI'], last['close']
-
-def open_order(side, price, rsi):
-    side_order = "BUY" if side=="LONG" else "SELL"
-    ts = int(time.time()*1000)
-    sl = price*(1-SL_PCT/100) if side=="LONG" else price*(1+SL_PCT/100)
-    tp = price*(1+TP_PCT/100) if side=="LONG" else price*(1-TP_PCT/100)
-    params = {"symbol":SYMBOL,"side":side_order,"positionSide":side,"type":"MARKET","quantity":QTY_USDT,"takeProfit":f"{tp:.2f}","stopLoss":f"{sl:.2f}","timestamp":ts}
-    params["signature"]=sign(params)
-    r = requests.post(BASE_URL+"/openApi/swap/v2/trade/order", headers={"X-BX-APIKEY":API_KEY}, data=params)
-    print(f"{side} {price} RSI:{rsi:.1f} -> {r.text}")
-
-print(f"BOT INICIADO {SYMBOL} {TIMEFRAME} ${QTY_USDT} {LEVERAGE}x")
-while True:
+def get_data():
     try:
-        df=get_klines()
-        signal,rsi,price=calc_signals(df)
-        print(f"{datetime.now().strftime('%H:%M:%S')} {price} RSI:{rsi:.1f} -> {signal}")
-        if signal!="NADA":
-            open_order(signal,price,rsi)
-            time.sleep(300)
-        time.sleep(20)
+        # Datos de BingX
+        url = f"https://open-api.bingx.com/openApi/swap/v3/quote/klines?symbol={SYMBOL}&interval=5m&limit=100"
+        data = requests.get(url, timeout=10).json()['data']
+        closes = [float(x['close']) for x in data]
+        vols = [float(x['volume']) for x in data]
+        
+        # RSI simple
+        import ta
+        df = pd.DataFrame({'close': closes})
+        rsi = ta.momentum.RSIIndicator(df['close'], 14).rsi().iloc[-1]
+        
+        vol_now = vols[-1]
+        vol_avg = sum(vols[-20:]) / 20
+        vol_status = "ALTO ✅ ENTRA CON FUERZA" if vol_now > vol_avg*1.2 else "BAJO ⚠️ ESPERA"
+        
+        price = closes[-1]
+        
+        signal = "NADA - Esperando"
+        if rsi < 30 and vol_now > vol_avg:
+            signal = f"LONG - RSI {rsi:.1f} + Vol ALTO"
+        elif rsi > 70 and vol_now > vol_avg:
+            signal = f"SHORT - RSI {rsi:.1f} + Vol ALTO"
+        elif rsi < 30:
+            signal = f"RSI bajo pero VOL BAJO - No entra aún"
+        
+        last_data.update({
+            "price": price, "rsi": round(rsi,2),
+            "vol_now": round(vol_now,2), "vol_avg": round(vol_avg,2),
+            "vol_status": vol_status, "signal": signal,
+            "time": time.strftime("%H:%M:%S")
+        })
+        print(f"{price} RSI:{rsi:.1f} Vol:{vol_status} -> {signal}")
     except Exception as e:
-        print(e)
-        time.sleep(15)
+        print(f"Error datos: {e}")
+
+def bot_loop():
+    while True:
+        get_data()
+        time.sleep(20)
+
+@app.route("/")
+def home():
+    return f"Bot {SYMBOL} activo - Ve a /dashboard"
+
+@app.route("/dashboard")
+def dashboard():
+    d = last_data
+    return f"""
+    <html><head><meta name='viewport' content='width=device-width'><meta http-equiv='refresh' content='20'></head>
+    <body style="font-family:sans-serif; background:#0f1115; color:#fff; padding:20px">
+    <h1>📊 ETH Bot 5x - Volumen</h1>
+    <div style="background:#1a1d24; padding:20px; border-radius:12px">
+    <h2>${d['price']}</h2>
+    <p><b>RSI:</b> {d['rsi']}</p>
+    <p><b>Volumen Ahora:</b> {d['vol_now']}</p>
+    <p><b>Volumen Promedio 20 velas:</b> {d['vol_avg']}</p>
+    <p><b>Estado:</b> {d['vol_status']}</p>
+    <hr>
+    <h3>Señal: {d['signal']}</h3>
+    <p>Actualizado: {d['time']} - auto recarga cada 20s</p>
+    </div>
+    <p style="color:#888">Solo entra cuando Volumen es ALTO ✅</p>
+    </body></html>
+    """
+
+threading.Thread(target=bot_loop, daemon=True).start()
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
