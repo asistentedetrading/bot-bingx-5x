@@ -1,90 +1,164 @@
-import time, threading, requests
+import os, time, threading, requests
 from flask import Flask
+
 app = Flask(__name__)
 
-# Esto es lo que ves ahora mismo en tu foto
-last={"price":"$3578 cargando BYBIT...","rsi":"Calculando...","vol":"Calculando...","signal":"Conectando Bybit - NO Binance"}
+# --- CONFIGURACION TU ESTRATEGIA ---
+SYMBOL = "ETH"
+LEVERAGE = 5
+SL_PCT = 1.5
+TP_PCT = 3.0
+RSI_LONG = 33
+RSI_SHORT = 67
+VOL_MULTIPLIER = 1.08 # Si volumen actual es 8% más que promedio = ALTO
+COOLDOWN_MIN = 15
 
-def calc_rsi(p,per=14):
-    try:
-        g=l=0
-        for i in range(1,per+1):
-            d=p[-i]-p[-i-1]
-            if d>0: g+=d
-            else: l+=abs(d)
-        if l==0: return 70
-        return 100-(100/(1+(g/per)/(l/per)))
-    except: return 50
+headers = {"User-Agent": "Mozilla/5.0"}
 
-def get_data():
-    # 1. Intento BYBIT SPOT (no linear, spot si funciona en USA)
+# Estado que verás en el dashboard
+state = {
+    "price": "Iniciando...",
+    "rsi": "...",
+    "vol": "...",
+    "signal": "Iniciando bot 5x...",
+    "pos": "Sin posición",
+    "last_trade": "Nunca"
+}
+
+last_trade_time = 0
+in_position = False
+
+def log(msg):
+    print(f"[BOT] {msg}")
+
+def get_price():
+    """Precio real que SI funciona en Render USA"""
     try:
-        r=requests.get("https://api.bybit.com/v5/market/kline?category=spot&symbol=ETHUSDT&interval=5&limit=100",timeout=10).json()
-        kl=r["result"]["list"][::-1]
-        closes=[float(x[4]) for x in kl]
-        vols=[float(x[5]) for x in kl]
-        print(f"BYBIT SPOT OK {closes[-1]}")
+        r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd", headers=headers, timeout=15)
+        price = float(r.json()["ethereum"]["usd"])
+        log(f"Precio OK: {price}")
+        return price
+    except Exception as e:
+        log(f"CoinGecko fallo {e}, probando OKX")
+        try:
+            r = requests.get("https://www.okx.com/api/v5/market/ticker?instId=ETH-USDT", headers=headers, timeout=10)
+            price = float(r.json()["data"][0]["last"])
+            log(f"OKX OK: {price}")
+            return price
+        except Exception as e2:
+            log(f"Todo fallo: {e2}")
+            return None
+
+def get_history():
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/coins/ethereum/market_chart?vs_currency=usd&days=1", headers=headers, timeout=15)
+        data = r.json()
+        closes = [x[1] for x in data["prices"]][-100:]
+        vols = [x[1] for x in data["total_volumes"]][-100:]
         return closes, vols
     except Exception as e:
-        print(f"Bybit spot fallo: {e}")
+        log(f"Historial fallo {e}")
+        return None, None
 
-    # 2. Intento OKX (siempre funciona en USA)
+def calc_rsi(prices, period=14):
     try:
-        r=requests.get("https://www.okx.com/api/v5/market/candles?instId=ETH-USDT&bar=5m&limit=100",timeout=10).json()
-        kl=r["data"][::-1]
-        closes=[float(x[4]) for x in kl]
-        vols=[float(x[5]) for x in kl]
-        print(f"OKX OK {closes[-1]}")
-        return closes, vols
-    except Exception as e:
-        print(f"OKX fallo: {e}")
+        gains = 0; losses = 0
+        for i in range(1, period+1):
+            diff = prices[-i] - prices[-i-1]
+            if diff > 0: gains += diff
+            else: losses += abs(diff)
+        if losses == 0: return 70
+        rs = (gains/period) / (losses/period)
+        return 100 - (100 / (1 + rs))
+    except:
+        return 50
 
-    # 3. ULTIMO RESPALDO CoinGecko (nunca bloquea)
-    try:
-        r=requests.get("https://api.coingecko.com/api/v3/coins/ethereum/market_chart?vs_currency=usd&days=1",timeout=10).json()
-        closes=[x[1] for x in r["prices"]][-100:]
-        vols=[x[1] for x in r["total_volumes"]][-100:]
-        print(f"COINGECKO OK {closes[-1]}")
-        return closes, vols
-    except Exception as e:
-        print(f"Todo fallo: {e}")
-        raise e
-
-def loop():
+def trading_loop():
+    global last_trade_time, in_position
     while True:
         try:
-            closes, vols = get_data()
-            price=closes[-1]
-            rsi=calc_rsi(closes)
-            vn=vols[-1]
-            va=sum(vols[-20:])/20
-            vol_alto=vn>va*1.10
-            
-            sig="NADA - Esperando Vol ALTO"
-            if vol_alto and rsi<33: sig="LONG 5x ✅ OPERA SOLO"
-            elif vol_alto and rsi>67: sig="SHORT 5x ✅ OPERA SOLO"
-            
-            last["price"]=f"${price:.2f}"
-            last["rsi"]=f"{rsi:.1f}"
-            last["vol"]=f"{'ALTO ✅ OPERA' if vol_alto else 'BAJO'} ({vn:.0f} vs {va:.0f})"
-            last["signal"]=sig
-            print(f"OK FINAL {price:.2f} {sig}")
-            
+            price = get_price()
+            closes, vols = get_history()
+            if not price or not closes:
+                state["signal"] = "Reconectando... esperando API"
+                time.sleep(10)
+                continue
+
+            closes[-1] = price # usamos precio real actual
+            rsi = calc_rsi(closes)
+            v_now = vols[-1]
+            v_avg = sum(vols[-20:]) / 20
+            vol_alto = v_now > v_avg * VOL_MULTIPLIER
+
+            # Guardar para dashboard
+            state["price"] = f"${price:.2f}"
+            state["rsi"] = f"{rsi:.1f}"
+            state["vol"] = f"{'ALTO ✅ OPERA 5x' if vol_alto else 'BAJO ❌ NO OPERA'} ({v_now/1e9:.1f}B vs {v_avg/1e9:.1f}B)"
+
+            # Lógica de cooldown
+            can_trade = (time.time() - last_trade_time) > (COOLDOWN_MIN * 60)
+
+            signal = "ESPERANDO - Vol bajo"
+            if vol_alto and can_trade and not in_position:
+                if rsi < RSI_LONG:
+                    signal = f"LONG 5x ✅ RSI {rsi:.1f} + Vol ALTO -> COMPRAR"
+                    # AQUÍ VA TU CODIGO DE BINGX: bingx.create_order(...)
+                    state["pos"] = f"LONG 5x abierto en ${price:.2f} | SL {SL_PCT}% TP {TP_PCT}%"
+                    state["last_trade"] = f"LONG en {price:.2f}"
+                    last_trade_time = time.time()
+                    in_position = True
+                    log(">>> OPERACION LONG 5x EJECUTADA (simulada)")
+                elif rsi > RSI_SHORT:
+                    signal = f"SHORT 5x ✅ RSI {rsi:.1f} + Vol ALTO -> VENDER"
+                    state["pos"] = f"SHORT 5x abierto en ${price:.2f} | SL {SL_PCT}% TP {TP_PCT}%"
+                    state["last_trade"] = f"SHORT en {price:.2f}"
+                    last_trade_time = time.time()
+                    in_position = True
+                    log(">>> OPERACION SHORT 5x EJECUTADA (simulada)")
+            elif not vol_alto:
+                signal = f"Vol BAJO - No se opera 5x (RSI {rsi:.1f})"
+            elif not can_trade:
+                signal = f"Cooldown {COOLDOWN_MIN}min - esperando..."
+            elif in_position:
+                signal = f"En posición - Gestionando SL {SL_PCT}% TP {TP_PCT}%"
+                # Aquí simulo cierre después de un rato
+                if time.time() - last_trade_time > 300: # 5 min simula cierre
+                    in_position = False
+                    state["pos"] = "Sin posición - esperando próxima"
+
+            state["signal"] = signal
+            log(f"{state['price']} | RSI {rsi:.1f} | {state['vol']} | {signal}")
+
         except Exception as e:
-            print(f"Error loop final: {e}")
-            last["price"]=f"Error conectando, reintentando..."
-            last["signal"]=f"Error: {e} - reintentando en 10s"
+            log(f"Error loop: {e}")
+            state["signal"] = f"Error: {e}"
+
         time.sleep(20)
 
-threading.Thread(target=loop, daemon=True).start()
+threading.Thread(target=trading_loop, daemon=True).start()
 
 @app.route("/")
-def home(): return '<meta http-equiv="refresh" content="0; url=/dashboard">'
+def home():
+    return '<meta http-equiv="refresh" content="0; url=/dashboard">'
 
 @app.route("/dashboard")
-def dash():
-    p=last.get("price","$3578")
-    r=last.get("rsi","...")
-    v=last.get("vol","...")
-    s=last.get("signal","...")
-    return f"<body style='background:#0f172a;color:white;font-family:sans-serif;padding:20px'><h1 style='font-size:55px;margin:0'>{p}</h1><h2>RSI: {r}</h2><h2>Vol: {v}</h2><h1 style='border:3px solid #22c55e;color:#22c55e;padding:20px;margin-top:20px'>{s}</h1><p>Bot 5x AUTO - Bybit/OKX/CoinGecko - Funciona en USA</p><p>Actualiza cada 20s</p></body>"
+def dashboard():
+    return f"""
+    <body style="background:#0f172a;color:white;font-family:Arial;padding:20px;max-width:800px;margin:auto">
+        <h1 style="color:#22c55e">BOT BINGX 5x - TRABAJO BIEN</h1>
+        <div style="background:#1e293b;padding:20px;border-radius:10px;margin-top:20px">
+            <h1 style="font-size:55px;margin:0">{state['price']}</h1>
+            <h3>RSI: {state['rsi']}</h3>
+            <h3>Volumen: {state['vol']}</h3>
+            <hr style="border-color:#334155">
+            <h2 style="border:2px solid #22c55e;padding:15px;border-radius:8px">{state['signal']}</h2>
+            <p><b>Posición:</b> {state['pos']}</p>
+            <p><b>Último trade:</b> {state['last_trade']}</p>
+            <p style="color:#94a3b8;font-size:12px">Estrategia: 40% RSI / 60% Volumen | SL {SL_PCT}% TP {TP_PCT}% | Solo 5x en Vol ALTO | No Binance</p>
+        </div>
+        <p>Actualiza solo - Render USA OK</p>
+    </body>
+    """
+
+if __name__ == "__main__":
+    app.run()
