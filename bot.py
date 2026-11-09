@@ -1,89 +1,108 @@
 from flask import Flask
-import os, time, threading, requests
-import pandas as pd
+import requests, time, threading
 
 app = Flask(__name__)
 
 SYMBOL = "ETH-USDT"
-last_data = {"price": 0, "rsi": 0, "vol_now": 0, "vol_avg": 0, "vol_status": "Cargando...", "signal": "Cargando...", "time": "...", "error": ""}
+last_data = {"price":"Cargando...","rsi":"...","vol_now":"...","vol_avg":"...","vol_status":"Cargando...","signal":"Cargando...","time":"..."}
+
+def calc_rsi(prices, period=14):
+    try:
+        gains = []
+        losses = []
+        for i in range(1, len(prices)):
+            diff = prices[i] - prices[i-1]
+            if diff >= 0:
+                gains.append(diff)
+                losses.append(0)
+            else:
+                gains.append(0)
+                losses.append(abs(diff))
+        avg_gain = sum(gains[-period:]) / period
+        avg_loss = sum(losses[-period:]) / period
+        if avg_loss == 0:
+            return 100
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+    except:
+        return 50
 
 def get_data():
-    try:
-        # Endpoint corregido v2
-        url = f"https://open-api.bingx.com/openApi/swap/v2/quote/klines?symbol={SYMBOL}&interval=5m&limit=100"
-        resp = requests.get(url, timeout=10).json()
-        # print(resp) para debug
-        if 'data' not in resp:
-            last_data["error"] = f"API error: {str(resp)[:200]}"
-            return
-        
-        data = resp['data']
-        # BingX v2 devuelve lista directa
-        if isinstance(data, dict) and 'data' in data:
-            data = data['data']
-        
-        closes = [float(x[4]) if isinstance(x, list) else float(x['close']) for x in data]
-        vols = [float(x[5]) if isinstance(x, list) else float(x['volume']) for x in data]
-        
-        import ta
-        df = pd.DataFrame({'close': closes})
-        rsi = ta.momentum.RSIIndicator(df['close'], 14).rsi().iloc[-1]
-        
-        vol_now = vols[-1]
-        vol_avg = sum(vols[-20:]) / 20
-        vol_status = "ALTO ✅" if vol_now > vol_avg*1.2 else "BAJO ⚠️"
-        
-        price = closes[-1]
-        
-        signal = "Esperando"
-        if rsi < 30 and vol_now > vol_avg:
-            signal = f"LONG - RSI {rsi:.1f} + Vol ALTO"
-        elif rsi > 70 and vol_now > vol_avg:
-            signal = f"SHORT - RSI {rsi:.1f} + Vol ALTO"
-        else:
-            signal = f"NADA - RSI {rsi:.1f} Vol {vol_status}"
-
-        last_data.update({
-            "price": price, "rsi": round(rsi,2),
-            "vol_now": round(vol_now,4), "vol_avg": round(vol_avg,4),
-            "vol_status": vol_status, "signal": signal,
-            "time": time.strftime("%H:%M:%S"),
-            "error": ""
-        })
-    except Exception as e:
-        last_data["error"] = str(e)
-        print(f"Error: {e}")
-
-def bot_loop():
+    global last_data
     while True:
-        get_data()
+        try:
+            url = f"https://open-api.bingx.com/openApi/swap/v2/quote/klines?symbol={SYMBOL}&interval=5m&limit=100"
+            r = requests.get(url, timeout=10).json()
+            data = r.get('data', [])
+            if isinstance(data, dict):
+                data = data.get('data', [])
+            
+            closes = []
+            vols = []
+            for x in data:
+                if isinstance(x, dict):
+                    closes.append(float(x.get('close',0)))
+                    vols.append(float(x.get('volume',0)))
+                else: # lista
+                    closes.append(float(x[4]))
+                    vols.append(float(x[5]))
+
+            price = closes[-1]
+            rsi = calc_rsi(closes)
+            vol_now = vols[-1]
+            vol_avg = sum(vols[-20:]) / 20
+            vol_status = "ALTO ✅" if vol_now > vol_avg*1.2 else "BAJO ⚠️"
+            
+            signal = f"RSI {rsi:.1f}"
+            if rsi < 30 and vol_now > vol_avg:
+                signal = f"LONG - RSI {rsi:.1f} + Vol ALTO"
+            elif rsi > 70 and vol_now > vol_avg:
+                signal = f"SHORT - RSI {rsi:.1f} + Vol ALTO"
+            else:
+                signal = f"ESPERA - RSI {rsi:.1f} Vol {vol_status}"
+
+            last_data = {
+                "price": f"${price:.2f}",
+                "rsi": f"{rsi:.1f}",
+                "vol_now": f"{vol_now:.2f}",
+                "vol_avg": f"{vol_avg:.2f}",
+                "vol_status": vol_status,
+                "signal": signal,
+                "time": time.strftime("%H:%M:%S")
+            }
+            print(f"{price} {signal}")
+        except Exception as e:
+            print(f"Error: {e}")
+            last_data["signal"] = f"Error: {e}"
         time.sleep(20)
 
 @app.route("/")
 def home():
-    return f"Bot activo - <a href='/dashboard'>Ir a Dashboard Volumen</a>"
+    return f"<a href='/dashboard'>Ir a Dashboard Volumen</a> - Bot {SYMBOL} activo"
 
 @app.route("/dashboard")
 def dashboard():
     d = last_data
     return f"""
-    <html><head><meta name='viewport' content='width=device-width'><meta http-equiv='refresh' content='20'></head>
-    <body style="font-family:sans-serif; background:#0f1115; color:#fff; padding:20px">
-    <h1>📊 ETH Bot 5x - Volumen</h1>
-    <div style="background:#1a1d24; padding:20px; border-radius:12px">
-    <h2>${d['price']}</h2>
+    <html><head><meta name='viewport' content='width=device-width'><meta http-equiv='refresh' content='20'>
+    <style>body{{font-family:sans-serif;background:#0f1115;color:#fff;padding:20px}} .card{{background:#1a1d24;padding:20px;border-radius:15px}} h2{{color:#00ff88}}</style>
+    </head><body>
+    <h1>📊 {SYMBOL} - Volumen Dashboard</h1>
+    <div class="card">
+    <h2>{d['price']}</h2>
     <p><b>RSI:</b> {d['rsi']}</p>
     <p><b>Volumen Ahora:</b> {d['vol_now']}</p>
-    <p><b>Promedio 20:</b> {d['vol_avg']}</p>
+    <p><b>Volumen Promedio 20 velas:</b> {d['vol_avg']}</p>
     <p><b>Estado Volumen:</b> {d['vol_status']}</p>
     <hr>
     <h3>Señal: {d['signal']}</h3>
-    <p>Actualizado: {d['time']}</p>
-    <p style="color:orange">Debug: {d['error']}</p>
+    <p>Actualizado: {d['time']} - Se recarga cada 20s</p>
     </div>
+    <p>✅ Solo entra si dice ALTO</p>
     </body></html>
     """
 
-threading.Thread(target=bot_loop, daemon=True).start()
+threading.Thread(target=get_data, daemon=True).start()
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
